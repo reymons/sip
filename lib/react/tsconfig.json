@@ -1,0 +1,13 @@
+{
+    "compilerOptions": {
+        "strict": true,
+        "target": "es6",
+        "lib": ["es6"],
+        "jsx": "react-jsx",
+        "module": "es6",
+        "moduleResolution": "node",
+        "esModuleInterop": false,
+        "declaration": true,
+    },
+    "include": ["**/*"],
+}
