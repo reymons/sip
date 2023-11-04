@@ -2,13 +2,12 @@ import http from "http";
 import sharp from "sharp";
 import path from "path";
 import fs from "fs";
-import cp from "child_process";
-import qs from "querystring";
 import crypto from "crypto";
 import { pipeline } from "stream";
 
 type Format = "image/avif" | "image/webp";
 type Ext = ".avif" | ".webp";
+type Dir = Record<string, string[]>;
 
 interface SipServerConfig {
     output: string;
@@ -17,34 +16,30 @@ interface SipServerConfig {
     ttl?: number;
 }
 
-interface AcceptedQuery {
-    src?: string;
-}
-
 class SipServer extends http.Server {
+    private readonly EXT_BY_FORMAT: Record<Format, Ext> = {
+        "image/avif": ".avif",
+        "image/webp": ".webp"
+    };
     private readonly output: string;
     private readonly formats: Format[];
     private readonly context: string;
     private readonly ttl: number;
-    private files: Set<string>;
-    private readonly EXT_BY_FORMAT: Record<Format, Ext> = {
-        "image/avif": ".avif",
-        "image/webp": ".webp"
-    }
+    private dir: Dir;
 
     constructor(config: SipServerConfig) {
-        super();
         if (!path.isAbsolute(config.output)) {
             throw new Error("'output' should be an absolute path");
         }
         if (!path.isAbsolute(config.context)) {
             throw new Error("'context' should be an absolute path");
         }
+        super();
         this.output = config.output;
         this.formats = config.formats;
         this.context = config.context;
-        this.ttl = config.ttl ?? 1000 * 60 * 60 * 24 * 7;
-        this.files = new Set();
+        this.ttl = config.ttl ?? 1000 * 60 * 60 * 24 * 1;
+        this.dir = {};
     }
 
     private error(res: http.ServerResponse, status: number, msg?: string) {
@@ -67,12 +62,26 @@ class SipServer extends http.Server {
         });
     }
 
-    start(port: number, callback?: () => void) {
+    run(port: number, callback?: () => void) {
         if (!fs.existsSync(this.output)) {
-            cp.execSync(`mkdir ${this.output}`);
+            fs.mkdirSync(this.output);
         }
 
-        this.files = new Set(fs.readdirSync(this.output));
+        const entries = fs.readdirSync(this.output, {
+            withFileTypes: true
+        });
+
+        for (const entry of entries) {
+            if (entry.isDirectory()) {
+                const pathname = path.join(this.output, entry.name);
+                const dirEntries = fs.readdirSync(pathname, {
+                    withFileTypes: true
+                });
+                this.dir[entry.name] = dirEntries
+                                            .filter(e => e.isFile())
+                                            .map(e => e.name);
+            }
+        }
 
         this.on("request", (req, res) => {
             if (!req.url) {
@@ -91,25 +100,33 @@ class SipServer extends http.Server {
             if (!format) {
                 return this.error(res, 502, "No format found");
             }
-            const queryStr = req.url.split("?").at(1);
-            if (!queryStr) {
-                return this.error(res, 400, "No query");
+            let [fileName] = req.url.split("?");
+            if (!fileName) {
+                return this.error(res, 404);
             }
-            const query = qs.parse(queryStr) as AcceptedQuery;
-            if (!query.src) {
-                return this.error(res, 400, "Src is empty");
-            }
-            query.src = decodeURIComponent(query.src);
+            fileName = decodeURIComponent(fileName);
             const ext = this.EXT_BY_FORMAT[format];
-            const hash = crypto
-                            .createHash("sha256")
-                            .update(query.src)
-                            .digest("hex") + ext;
-            if (this.files.has(hash)) {
-                const rs = fs.createReadStream(path.join(this.output, hash));
-                this.writeHead(res, format);
-                pipeline(rs, res, () => res.end());
-                return;
+            const dirHash = crypto
+                                .createHash("sha1")
+                                .update(req.url)
+                                .digest("hex");
+            if (this.dir[dirHash]) {
+                const file = this.dir[dirHash].find(file => file.endsWith(ext));
+                if (file) {
+                    const createdAt = Number(file.split(".")[0]);
+                    const fileFullPath = path.join(this.output, dirHash, file);
+                    if (Date.now() - createdAt > this.ttl) {
+                        // TODO: add expired-images collector
+                        fs.unlink(fileFullPath, () => {});
+                        this.dir[dirHash] = this.dir[dirHash]
+                                                .filter(_file => _file !== file); 
+                    } else {
+                        const rs = fs.createReadStream(fileFullPath);
+                        this.writeHead(res, format);
+                        pipeline(rs, res, () => res.end());
+                        return;
+                    }
+                }
             }
             let ss = sharp();
             switch (format) {
@@ -121,11 +138,24 @@ class SipServer extends http.Server {
                 ss = ss.webp();
                 break;
             }}
-            const rs = fs.createReadStream(path.join(this.context, query.src));
-            const ws = fs.createWriteStream(path.join(this.output, hash));
+            const rs = fs.createReadStream(path.join(this.context, fileName));
+            const outputFile = `${Date.now()}${ext}`;
+            if (!this.dir[dirHash]) {
+                fs.mkdirSync(path.join(this.output, dirHash));
+            }
+            const ws = fs.createWriteStream(
+                path.join(this.output, dirHash, outputFile)
+            );
             this.writeHead(res, format);
             pipeline(rs, ss, ws, (err) => {
-                if (!err) this.files.add(hash);
+                if (err) {
+                    res.end();
+                } else {
+                    if (!this.dir[dirHash]) {
+                        this.dir[dirHash] = [];
+                    }
+                    this.dir[dirHash].push(outputFile);
+                }
             });
             pipeline(ss, res, () => res.end());
         });
@@ -134,12 +164,4 @@ class SipServer extends http.Server {
     }
 }
 
-const server = new SipServer({
-    output: process.cwd() + "/_images",
-    context: process.cwd() + "/_dist",
-    formats: ["image/avif", "image/webp"],
-});
-
-server.start(7000, () => {
-    console.log("Listening on port 7000")
-});
+export default SipServer;

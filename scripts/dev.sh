@@ -1,3 +1,3 @@
 #!/bin/bash
 
-ts-node lib/core/main.ts
+ts-node dev/main.ts

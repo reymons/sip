@@ -3,6 +3,6 @@
 
 node_modules/
 build/
-_images/
-_dist/
-_client/
+dev/result/
+dev/images/*
+dev/index.html
